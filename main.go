@@ -85,17 +85,18 @@ func generateUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:]), nil
 }
 
-func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool) (string, error) {
-	// Генерируем уникальное имя (без расширения)
+func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool, clipRange string) (string, error) {
 	uuid, err := generateUUID()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate UUID: %w", err)
 	}
-	outputTemplate := fmt.Sprintf("downloads/%s.%%(ext)s", uuid) // Используем {ext} для сохранения оригинального расширения
+	outputTemplate := fmt.Sprintf("downloads/%s.%%(ext)s", uuid)
 
 	var cmd *exec.Cmd
 	if audioOnly {
 		cmd = exec.CommandContext(ctx, "yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0", "-o", outputTemplate, url)
+	} else if clipRange != "" {
+		cmd = exec.CommandContext(ctx, "yt-dlp", "-o", outputTemplate, "--download-sections", "*"+clipRange, url)
 	} else {
 		cmd = exec.CommandContext(ctx, "yt-dlp", "-o", outputTemplate, url)
 	}
@@ -107,7 +108,6 @@ func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool) (st
 
 	log.Printf("yt-dlp output: %s", string(output))
 
-	// Поиск загруженного файла
 	dir := "downloads"
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -125,26 +125,28 @@ func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool) (st
 
 func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
 	chatID := msg.Chat.ID
-	parts := strings.SplitN(msg.Text, " ", 2) // Разделяем команду и URL
-
-	if len(parts) < 2 {
-		return createMessage(chatID, "Please provide a URL.")
+	args := strings.Fields(msg.Text)
+	if len(args) < 2 {
+		return createMessage(chatID, "Invalid command format. Use: /command URL [time_range]")
 	}
 
-	command, mediaURL := parts[0], parts[1]
+	url := args[1]
+	clipRange := ""
+	if len(args) == 3 {
+		clipRange = args[2]
+	}
 
-	switch command {
-	case "/start":
+	switch msg.Command() {
+	case "start":
 		return createMessage(chatID, "Welcome! I am your bot.")
-	case "/help":
-		helpText := "Commands:\n/start - Start the bot\n/help - Show this message\n/vid <URL> - Download and send a video\n/audio <URL> - Download and send an audio file"
-		return createMessage(chatID, helpText)
-	case "/audio":
-		return downloadAndProcessMedia(chatID, mediaURL, bot, true)
-	case "/vid":
-		return downloadAndProcessMedia(chatID, mediaURL, bot, false)
+	case "help":
+		return createMessage(chatID, "Commands:\n/start - Start the bot\n/help - Show this message\n/vid - Download and send a video\n/audio - Download and send an audio file\n/clip - Download a video clip with a specified time range")
+	case "audio":
+		return downloadAndProcessMedia(chatID, url, bot, true, "")
+	case "clip":
+		return downloadAndProcessMedia(chatID, url, bot, false, clipRange)
 	default:
-		return createMessage(chatID, "Unknown command. Use /help to see available commands.")
+		return downloadAndProcessMedia(chatID, url, bot, false, "")
 	}
 }
 
@@ -154,8 +156,8 @@ func uploadToYandexDisk(filePath string) (string, error) {
 	return "https://yadi.sk/d/example", nil
 }
 
-func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool) *tgbotapi.MessageConfig {
-	go func(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool) {
+func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool, clipRange string) *tgbotapi.MessageConfig {
+	go func(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool, clipRange string) {
 		statusMsg := createMessage(chatID, "Downloading media...")
 		if _, err := bot.Send(*statusMsg); err != nil {
 			log.Printf("Failed to send status message: %v", err)
@@ -164,7 +166,7 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		downloadedFile, err := DownloadMediaWithYTDLP(ctx, mediaURL, audioOnly)
+		downloadedFile, err := DownloadMediaWithYTDLP(ctx, mediaURL, audioOnly, clipRange)
 		if err != nil {
 			log.Printf("Error downloading media: %v", err)
 			if _, sendErr := bot.Send(*createMessage(chatID, "Error downloading media")); sendErr != nil {
@@ -173,7 +175,6 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 			return
 		}
 
-		// Проверка размера файла
 		fileInfo, err := os.Stat(downloadedFile)
 		if err != nil {
 			log.Printf("Failed to get file info: %v", err)
@@ -200,7 +201,6 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 			return
 		}
 
-		// Отправляем файл
 		var mediaMsg tgbotapi.Chattable
 		if audioOnly {
 			mediaMsg = tgbotapi.NewAudio(chatID, tgbotapi.FilePath(downloadedFile))
@@ -216,11 +216,10 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 			return
 		}
 
-		// Удаляем файл после успешной отправки
 		if err := os.Remove(downloadedFile); err != nil {
 			log.Printf("Error deleting file %s: %v", downloadedFile, err)
 		}
-	}(chatID, mediaURL, bot, audioOnly)
+	}(chatID, mediaURL, bot, audioOnly, clipRange)
 
 	return createMessage(chatID, "Media processing started...")
 }
