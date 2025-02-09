@@ -85,7 +85,7 @@ func generateUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:]), nil
 }
 
-func DownloadVideoWithYTDLP(ctx context.Context, url string) (string, error) {
+func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool) (string, error) {
 	// Генерируем уникальное имя (без расширения)
 	uuid, err := generateUUID()
 	if err != nil {
@@ -93,7 +93,13 @@ func DownloadVideoWithYTDLP(ctx context.Context, url string) (string, error) {
 	}
 	outputTemplate := fmt.Sprintf("downloads/%s.%%(ext)s", uuid) // Используем {ext} для сохранения оригинального расширения
 
-	cmd := exec.CommandContext(ctx, "yt-dlp", "-o", outputTemplate, url)
+	var cmd *exec.Cmd
+	if audioOnly {
+		cmd = exec.CommandContext(ctx, "yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0", "-o", outputTemplate, url)
+	} else {
+		cmd = exec.CommandContext(ctx, "yt-dlp", "-o", outputTemplate, url)
+	}
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("yt-dlp failed: %w\nOutput: %s", err, string(output))
@@ -119,19 +125,38 @@ func DownloadVideoWithYTDLP(ctx context.Context, url string) (string, error) {
 
 func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
 	chatID := msg.Chat.ID
-	switch msg.Command() {
-	case "start":
+	parts := strings.SplitN(msg.Text, " ", 2) // Разделяем команду и URL
+
+	if len(parts) < 2 {
+		return createMessage(chatID, "Please provide a URL.")
+	}
+
+	command, mediaURL := parts[0], parts[1]
+
+	switch command {
+	case "/start":
 		return createMessage(chatID, "Welcome! I am your bot.")
-	case "help":
-		helpText := "Commands:\n/start - Start the bot\n/help - Show this message\n/vid - Upload a video"
+	case "/help":
+		helpText := "Commands:\n/start - Start the bot\n/help - Show this message\n/vid <URL> - Download and send a video\n/audio <URL> - Download and send an audio file"
 		return createMessage(chatID, helpText)
+	case "/audio":
+		return downloadAndProcessMedia(chatID, mediaURL, bot, true)
+	case "/vid":
+		return downloadAndProcessMedia(chatID, mediaURL, bot, false)
 	default:
-		return downloadAndProcessVideo(chatID, msg.Text, bot)
+		return createMessage(chatID, "Unknown command. Use /help to see available commands.")
 	}
 }
-func downloadAndProcessVideo(chatID int64, videoURL string, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
-	go func(chatID int64, videoURL string, bot *tgbotapi.BotAPI) { // Передача параметров в горутину
-		statusMsg := createMessage(chatID, "Downloading video...")
+
+func uploadToYandexDisk(filePath string) (string, error) {
+	// Заглушка для загрузки на Яндекс Диск
+	// Здесь должен быть код API загрузки, возвращающий ссылку на файл
+	return "https://yadi.sk/d/example", nil
+}
+
+func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool) *tgbotapi.MessageConfig {
+	go func(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool) {
+		statusMsg := createMessage(chatID, "Downloading media...")
 		if _, err := bot.Send(*statusMsg); err != nil {
 			log.Printf("Failed to send status message: %v", err)
 		}
@@ -139,10 +164,10 @@ func downloadAndProcessVideo(chatID int64, videoURL string, bot *tgbotapi.BotAPI
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		downloadedFile, err := DownloadVideoWithYTDLP(ctx, videoURL)
+		downloadedFile, err := DownloadMediaWithYTDLP(ctx, mediaURL, audioOnly)
 		if err != nil {
-			log.Printf("Error downloading video: %v", err)
-			if _, sendErr := bot.Send(*createMessage(chatID, "Error downloading video")); sendErr != nil {
+			log.Printf("Error downloading media: %v", err)
+			if _, sendErr := bot.Send(*createMessage(chatID, "Error downloading media")); sendErr != nil {
 				log.Printf("Failed to send error message: %v", sendErr)
 			}
 			return
@@ -160,17 +185,32 @@ func downloadAndProcessVideo(chatID int64, videoURL string, bot *tgbotapi.BotAPI
 
 		const maxSize int64 = 50 * 1024 * 1024 // 50MB
 		if fileInfo.Size() > maxSize {
-			log.Printf("File %s is too large (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024)
-			if _, sendErr := bot.Send(*createMessage(chatID, fmt.Sprintf("File downloaded: %s\nBut it's too large to send (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024))); sendErr != nil {
-				log.Printf("Failed to send file too large message: %v", sendErr)
+			log.Printf("File %s is too large (%.2f MB), uploading to Yandex Disk...", downloadedFile, float64(fileInfo.Size())/1024/1024)
+			uploadURL, err := uploadToYandexDisk(downloadedFile)
+			if err != nil {
+				log.Printf("Failed to upload file to Yandex Disk: %v", err)
+				if _, sendErr := bot.Send(*createMessage(chatID, "Error uploading large file to Yandex Disk")); sendErr != nil {
+					log.Printf("Failed to send error message: %v", sendErr)
+				}
+				return
+			}
+			if _, sendErr := bot.Send(*createMessage(chatID, fmt.Sprintf("File uploaded to Yandex Disk: %s", uploadURL))); sendErr != nil {
+				log.Printf("Failed to send file upload link: %v", sendErr)
 			}
 			return
 		}
 
 		// Отправляем файл
-		if _, err := bot.Send(tgbotapi.NewVideo(chatID, tgbotapi.FilePath(downloadedFile))); err != nil {
-			log.Printf("Error sending video: %v", err)
-			if _, sendErr := bot.Send(*createMessage(chatID, "Failed to send video")); sendErr != nil {
+		var mediaMsg tgbotapi.Chattable
+		if audioOnly {
+			mediaMsg = tgbotapi.NewAudio(chatID, tgbotapi.FilePath(downloadedFile))
+		} else {
+			mediaMsg = tgbotapi.NewVideo(chatID, tgbotapi.FilePath(downloadedFile))
+		}
+
+		if _, err := bot.Send(mediaMsg); err != nil {
+			log.Printf("Error sending media: %v", err)
+			if _, sendErr := bot.Send(*createMessage(chatID, "Failed to send media")); sendErr != nil {
 				log.Printf("Failed to send failure message: %v", sendErr)
 			}
 			return
@@ -180,20 +220,12 @@ func downloadAndProcessVideo(chatID int64, videoURL string, bot *tgbotapi.BotAPI
 		if err := os.Remove(downloadedFile); err != nil {
 			log.Printf("Error deleting file %s: %v", downloadedFile, err)
 		}
-	}(chatID, videoURL, bot) // Вызов анонимной функции с параметрами
+	}(chatID, mediaURL, bot, audioOnly)
 
-	return createMessage(chatID, "Video processing started...")
+	return createMessage(chatID, "Media processing started...")
 }
+
 func createMessage(chatID int64, text string) *tgbotapi.MessageConfig {
 	m := tgbotapi.NewMessage(chatID, text)
 	return &m
-}
-
-func sendRawVideo(chatID int64, filePath string, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
-	video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(filePath))
-	if _, err := bot.Send(video); err != nil {
-		log.Printf("Error sending video: %v", err)
-		return createMessage(chatID, "Failed to send video")
-	}
-	return createMessage(chatID, "Video sent successfully!")
 }
