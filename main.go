@@ -129,46 +129,61 @@ func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.Messag
 		return downloadAndProcessVideo(chatID, msg.Text, bot)
 	}
 }
-
 func downloadAndProcessVideo(chatID int64, videoURL string, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
-	statusMsg := createMessage(chatID, "Downloading video...")
-	if _, err := bot.Send(*statusMsg); err != nil {
-		log.Printf("Failed to send status message: %v", err)
-	}
+	go func(chatID int64, videoURL string, bot *tgbotapi.BotAPI) { // Передача параметров в горутину
+		statusMsg := createMessage(chatID, "Downloading video...")
+		if _, err := bot.Send(*statusMsg); err != nil {
+			log.Printf("Failed to send status message: %v", err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
 
-	downloadedFile, err := DownloadVideoWithYTDLP(ctx, videoURL)
-	if err != nil {
-		log.Printf("Error downloading video: %v", err)
-		return createMessage(chatID, "Error downloading video")
-	}
+		downloadedFile, err := DownloadVideoWithYTDLP(ctx, videoURL)
+		if err != nil {
+			log.Printf("Error downloading video: %v", err)
+			if _, sendErr := bot.Send(*createMessage(chatID, "Error downloading video")); sendErr != nil {
+				log.Printf("Failed to send error message: %v", sendErr)
+			}
+			return
+		}
 
-	// Проверка размера файла
-	fileInfo, err := os.Stat(downloadedFile)
-	if err != nil {
-		log.Printf("Failed to get file info: %v", err)
-		return createMessage(chatID, "Error checking file size")
-	}
+		// Проверка размера файла
+		fileInfo, err := os.Stat(downloadedFile)
+		if err != nil {
+			log.Printf("Failed to get file info: %v", err)
+			if _, sendErr := bot.Send(*createMessage(chatID, "Error checking file size")); sendErr != nil {
+				log.Printf("Failed to send error message: %v", sendErr)
+			}
+			return
+		}
 
-	const maxSize int64 = 50 * 1024 * 1024 // 50MB
-	if fileInfo.Size() > maxSize {
-		log.Printf("File %s is too large (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024)
-		return createMessage(chatID, fmt.Sprintf("File downloaded: %s\nBut it's too large to send (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024))
-	}
+		const maxSize int64 = 50 * 1024 * 1024 // 50MB
+		if fileInfo.Size() > maxSize {
+			log.Printf("File %s is too large (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024)
+			if _, sendErr := bot.Send(*createMessage(chatID, fmt.Sprintf("File downloaded: %s\nBut it's too large to send (%.2f MB)", downloadedFile, float64(fileInfo.Size())/1024/1024))); sendErr != nil {
+				log.Printf("Failed to send file too large message: %v", sendErr)
+			}
+			return
+		}
 
-	// Отправляем файл
-	message := sendRawVideo(chatID, downloadedFile, bot)
+		// Отправляем файл
+		if _, err := bot.Send(tgbotapi.NewVideo(chatID, tgbotapi.FilePath(downloadedFile))); err != nil {
+			log.Printf("Error sending video: %v", err)
+			if _, sendErr := bot.Send(*createMessage(chatID, "Failed to send video")); sendErr != nil {
+				log.Printf("Failed to send failure message: %v", sendErr)
+			}
+			return
+		}
 
-	// Удаляем файл после успешной отправки
-	if err := os.Remove(downloadedFile); err != nil {
-		log.Printf("Error deleting file %s: %v", downloadedFile, err)
-	}
+		// Удаляем файл после успешной отправки
+		if err := os.Remove(downloadedFile); err != nil {
+			log.Printf("Error deleting file %s: %v", downloadedFile, err)
+		}
+	}(chatID, videoURL, bot) // Вызов анонимной функции с параметрами
 
-	return message
+	return createMessage(chatID, "Video processing started...")
 }
-
 func createMessage(chatID int64, text string) *tgbotapi.MessageConfig {
 	m := tgbotapi.NewMessage(chatID, text)
 	return &m
