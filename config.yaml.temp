@@ -1,2 +1,4 @@
 telegram:
   token: "you_telegram_token"
+yandex:
+  token: "you_yandex_token"
