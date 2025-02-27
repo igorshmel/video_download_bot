@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"github.com/davesavic/clink"
 	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gopkg.in/yaml.v3"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +23,12 @@ type Config struct {
 	Telegram struct {
 		Token string `yaml:"token"`
 	} `yaml:"telegram"`
+	Yandex struct {
+		Token string `yaml:"token"`
+	} `yaml:"yandex"`
 }
+
+const RemotePath = "test"
 
 func main() {
 	// Загрузка конфигурации
@@ -27,7 +36,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error loading configuration: %v", err)
 	}
-
 	// Создание бота
 	bot, err := tgbotapi.NewBotAPI(config.Telegram.Token)
 	if err != nil {
@@ -130,7 +138,7 @@ func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.Messag
 		return createMessage(chatID, "Invalid command format. Use: /command URL [time_range]")
 	}
 
-	url := args[1]
+	uRL := args[1]
 	clipRange := ""
 	if len(args) == 3 {
 		clipRange = args[2]
@@ -142,18 +150,23 @@ func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.Messag
 	case "help":
 		return createMessage(chatID, "Commands:\n/start - Start the bot\n/help - Show this message\n/vid - Download and send a video\n/audio - Download and send an audio file\n/clip - Download a video clip with a specified time range")
 	case "audio":
-		return downloadAndProcessMedia(chatID, url, bot, true, "")
+		return downloadAndProcessMedia(chatID, uRL, bot, true, "")
 	case "clip":
-		return downloadAndProcessMedia(chatID, url, bot, false, clipRange)
+		return downloadAndProcessMedia(chatID, uRL, bot, false, clipRange)
 	default:
-		return downloadAndProcessMedia(chatID, url, bot, false, "")
+		return downloadAndProcessMedia(chatID, uRL, bot, false, "")
 	}
 }
 
-func uploadToYandexDisk(filePath string) (string, error) {
-	// Заглушка для загрузки на Яндекс Диск
-	// Здесь должен быть код API загрузки, возвращающий ссылку на файл
-	return "https://yadi.sk/d/example", nil
+func uploadToYandexDisk(filePath, fileName string) (string, error) {
+	targetURL, err := getYandexDiskInfo(RemotePath, fileName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get upload URL: %w", err)
+	}
+
+	YandexPut(targetURL, filepath.Dir(filePath), fileName)
+
+	return fmt.Sprintf("https://disk.yandex.com/test/%s", fileName), nil
 }
 
 func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool, clipRange string) *tgbotapi.MessageConfig {
@@ -163,7 +176,7 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 			log.Printf("Failed to send status message: %v", err)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
 		downloadedFile, err := DownloadMediaWithYTDLP(ctx, mediaURL, audioOnly, clipRange)
@@ -184,10 +197,10 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 			return
 		}
 
-		const maxSize int64 = 50 * 1024 * 1024 // 50MB
+		const maxSize int64 = 20 * 1024 * 1024 // 50MB
 		if fileInfo.Size() > maxSize {
 			log.Printf("File %s is too large (%.2f MB), uploading to Yandex Disk...", downloadedFile, float64(fileInfo.Size())/1024/1024)
-			uploadURL, err := uploadToYandexDisk(downloadedFile)
+			uploadURL, err := uploadToYandexDisk(downloadedFile, fileInfo.Name())
 			if err != nil {
 				log.Printf("Failed to upload file to Yandex Disk: %v", err)
 				if _, sendErr := bot.Send(*createMessage(chatID, "Error uploading large file to Yandex Disk")); sendErr != nil {
@@ -227,4 +240,94 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 func createMessage(chatID int64, text string) *tgbotapi.MessageConfig {
 	m := tgbotapi.NewMessage(chatID, text)
 	return &m
+}
+
+// getYandexDiskInfo --
+func getYandexDiskInfo(remotePath string, fileName string) (string, error) {
+	// Загрузка конфигурации
+	config, err := LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Error loading configuration: %v", err)
+	}
+
+	path := url.PathEscape(fmt.Sprintf("%s/%s", remotePath, fileName))
+
+	// Create a new client with default options.
+	client := clink.NewClient()
+	urlString := fmt.Sprintf("%s%s%s%s%s", "https://cloud-api.yandex.net/v1/disk/resources/upload", "?", "path=", path, "&overwrite=true")
+
+	headers := map[string]string{
+		"Authorization": "OAuth " + config.Yandex.Token,
+	}
+	client.Headers = headers
+	// Create a new request with default options.
+	req, err := http.NewRequest(http.MethodGet, urlString, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// Send the request and get the response.
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	// Hydrate the response body into a map.
+	var response map[string]any
+	err = clink.ResponseToJson(resp, &response)
+
+	// Check if "href" key exists in the map.
+	targetUrl, ok := response["href"].(string)
+	if !ok {
+		return "", fmt.Errorf("href is not a string")
+	}
+
+	// Print the target map.
+	return targetUrl, nil
+}
+
+// YandexPut --
+func YandexPut(targetUrl string, localPath string, fileName string) {
+	// Загрузка конфигурации
+	config, err := LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Error loading configuration: %v", err)
+	}
+	req, err := http.NewRequest("PUT", targetUrl, nil)
+	if err != nil {
+		fmt.Println("Error creating HTTP request:", err)
+		return
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "OAuth "+config.Yandex.Token)
+
+	f, err := os.Open(fmt.Sprintf("%s/%s", localPath, fileName))
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return
+	}
+	defer func(f *os.File) {
+		err = f.Close()
+		if err != nil {
+
+		}
+	}(f)
+	fmt.Println("FileName:", f.Name())
+	req.Body = f
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Error making HTTP request:", err)
+		return
+	}
+	defer func(Body io.ReadCloser) {
+		err = Body.Close()
+		if err != nil {
+
+		}
+	}(resp.Body)
+
+	fmt.Println("HTTP response status:", resp.Status)
 }
