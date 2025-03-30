@@ -5,9 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"github.com/davesavic/clink"
-	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"gopkg.in/yaml.v3"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +14,10 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/davesavic/clink"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"gopkg.in/yaml.v3"
 )
 
 // Config структура для конфигурации
@@ -122,11 +123,17 @@ func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool, cli
 			progress := scanner.Text()
 			fmt.Printf("stdout: %s\n", progress)
 			if strings.Contains(progress, "25.0%") {
-				bot.Send(*createMessage(chatID, "25% downloaded..."))
+				if _, err := bot.Send(*createMessage(chatID, "25% downloaded...")); err != nil {
+					log.Printf("Failed to send progress message: %v", err)
+				}
 			} else if strings.Contains(progress, "50.0%") {
-				bot.Send(*createMessage(chatID, "50% downloaded..."))
+				if _, err := bot.Send(*createMessage(chatID, "50% downloaded...")); err != nil {
+					log.Printf("Failed to send progress message: %v", err)
+				}
 			} else if strings.Contains(progress, "75.0%") {
-				bot.Send(*createMessage(chatID, "75% downloaded..."))
+				if _, err := bot.Send(*createMessage(chatID, "75% downloaded...")); err != nil {
+					log.Printf("Failed to send progress message: %v", err)
+				}
 			}
 		}
 	}()
@@ -153,6 +160,11 @@ func DownloadMediaWithYTDLP(ctx context.Context, url string, audioOnly bool, cli
 
 	return "", fmt.Errorf("failed to find downloaded file with UUID: %s", uuid)
 }
+
+// downloadMedia downloads a video or audio file from the given URL using yt-dlp
+// It returns the path to the downloaded file and any error encountered
+// The function supports downloading audio-only files and specific video clips
+// Progress updates are sent to the Telegram chat during download
 
 func handleMessage(msg *tgbotapi.Message, bot *tgbotapi.BotAPI) *tgbotapi.MessageConfig {
 	chatID := msg.Chat.ID
@@ -199,7 +211,11 @@ func uploadToYandexDisk(filePath, fileName string) (string, error) {
 
 	YandexPut(targetURL, filepath.Dir(filePath), fileName)
 
-	return fmt.Sprintf("https://disk.yandex.com/test/%s", fileName), nil
+	shareLink, err := getYandexDiskShareLink(RemotePath, fileName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get share link: %w", err)
+	}
+	return shareLink, nil
 }
 
 func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI, audioOnly bool, clipRange string) *tgbotapi.MessageConfig {
@@ -215,29 +231,39 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 		downloadedFile, err := DownloadMediaWithYTDLP(ctx, mediaURL, audioOnly, clipRange, chatID, bot)
 		if err != nil {
 			log.Printf("Error downloading media: %v", err)
-			bot.Send(*createMessage(chatID, "Error downloading media"))
+			if _, err := bot.Send(*createMessage(chatID, "Error downloading media")); err != nil {
+				log.Printf("Failed to send error message: %v", err)
+			}
 			return
 		}
 
 		fileInfo, err := os.Stat(downloadedFile)
 		if err != nil {
 			log.Printf("Failed to get file info: %v", err)
-			bot.Send(*createMessage(chatID, "Error checking file size"))
+			if _, err := bot.Send(*createMessage(chatID, "Error checking file size")); err != nil {
+				log.Printf("Failed to send error message: %v", err)
+			}
 			return
 		}
 
 		const maxSize int64 = 50 * 1024 * 1024 // 50MB
 		if fileInfo.Size() > maxSize {
-			bot.Send(*createMessage(chatID, "File is too large, uploading to Yandex Disk..."))
+			if _, err := bot.Send(*createMessage(chatID, "File is too large, uploading to Yandex Disk...")); err != nil {
+				log.Printf("Failed to send status message: %v", err)
+			}
 
 			uploadURL, err := uploadToYandexDisk(downloadedFile, fileInfo.Name())
 			if err != nil {
 				log.Printf("Failed to upload file to Yandex Disk: %v", err)
-				bot.Send(*createMessage(chatID, "Error uploading large file to Yandex Disk"))
+				if _, err := bot.Send(*createMessage(chatID, "Error uploading large file to Yandex Disk")); err != nil {
+					log.Printf("Failed to send error message: %v", err)
+				}
 				return
 			}
 
-			bot.Send(*createMessage(chatID, fmt.Sprintf("File uploaded to Yandex Disk: %s", uploadURL)))
+			if _, err := bot.Send(*createMessage(chatID, fmt.Sprintf("File uploaded to Yandex Disk: %s", uploadURL))); err != nil {
+				log.Printf("Failed to send success message: %v", err)
+			}
 
 			if err := os.Remove(downloadedFile); err != nil {
 				log.Printf("Error deleting file %s: %v", downloadedFile, err)
@@ -254,7 +280,9 @@ func downloadAndProcessMedia(chatID int64, mediaURL string, bot *tgbotapi.BotAPI
 
 		if _, err := bot.Send(mediaMsg); err != nil {
 			log.Printf("Error sending media: %v", err)
-			bot.Send(*createMessage(chatID, "Failed to send media"))
+			if _, err := bot.Send(*createMessage(chatID, "Failed to send media")); err != nil {
+				log.Printf("Failed to send error message: %v", err)
+			}
 			return
 		}
 
@@ -303,7 +331,9 @@ func getYandexDiskInfo(remotePath string, fileName string) (string, error) {
 
 	// Hydrate the response body into a map.
 	var response map[string]any
-	err = clink.ResponseToJson(resp, &response)
+	if err = clink.ResponseToJson(resp, &response); err != nil {
+		return "", err
+	}
 
 	// Check if "href" key exists in the map.
 	targetUrl, ok := response["href"].(string)
@@ -312,6 +342,52 @@ func getYandexDiskInfo(remotePath string, fileName string) (string, error) {
 	}
 
 	// Print the target map.
+	return targetUrl, nil
+}
+
+func getYandexDiskShareLink(remotePath string, fileName string) (string, error) {
+	// Загрузка конфигурации
+	config, err := LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Error loading configuration: %v", err)
+	}
+
+	path := url.PathEscape(fmt.Sprintf("%s/%s", remotePath, fileName))
+
+	// Create a new client with default options.
+	client := clink.NewClient()
+	urlString := fmt.Sprintf("%s%s%s%s", "https://cloud-api.yandex.net/v1/disk/resources/download", "?", "path=", path)
+
+	headers := map[string]string{
+		"Authorization": "OAuth " + config.Yandex.Token,
+		"Accept":        "application/json",
+	}
+	client.Headers = headers
+
+	// Create a new request with default options.
+	req, err := http.NewRequest(http.MethodGet, urlString, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// Send the request and get the response.
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	// Hydrate the response body into a map.
+	var response map[string]any
+	if err = clink.ResponseToJson(resp, &response); err != nil {
+		return "", err
+	}
+
+	// Check if "href" key exists in the map.
+	targetUrl, ok := response["href"].(string)
+	if !ok {
+		return "", fmt.Errorf("href is not a string")
+	}
+
 	return targetUrl, nil
 }
 
